@@ -6,6 +6,17 @@ This crate currently provides the [Filtered Space-Saving algorithm](https://doi.
 
 Version numbers follow the [semver](https://semver.org/) convention.
 
+The filter stores `6 * k` one-byte counters and a shared 64-bit offset: `6 * k + 8`
+bytes of counter data, compared with `48 * k` bytes for full 64-bit filter counters.
+This excludes the vector header, allocator overhead, and monitored items.
+When filter values span more than 255, the offset advances and low values are
+rounded up to it. This can increase count estimates and change the returned top-k.
+Rebasing scans the filter in place and does not allocate additional counter storage.
+
+With the `serde` feature, `alphas` is now serialized as an object containing
+`offset` and byte `deltas`. Existing snapshots with an array of 64-bit `alphas`
+must be migrated before deserialization.
+
 ### Example
 
 ```rust
