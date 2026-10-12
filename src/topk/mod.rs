@@ -22,22 +22,43 @@ pub type DefaultAlphaHasher = AHasher;
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ElementCounter {
-    estimated_count: u64,
-    associated_error: u64,
+    estimated_count: u32,
+    associated_error: u32,
 }
 
 impl ElementCounter {
     fn new(estimated_count: u64, associated_error: u64) -> Self {
-        ElementCounter { estimated_count, associated_error }
+        ElementCounter {
+            estimated_count: estimated_count as u32,
+            associated_error: associated_error as u32,
+        }
+    }
+
+    fn increase(&mut self, count: u64) {
+        self.estimated_count = self.estimated_count.wrapping_add(count as u32);
+    }
+
+    fn plus(&self, count: u64, error: u64) -> Self {
+        Self {
+            estimated_count: self.estimated_count.wrapping_add(count as u32),
+            associated_error: self.associated_error.wrapping_add(error as u32),
+        }
+    }
+
+    fn scaled(&self, factor: f64) -> Self {
+        Self::new(
+            (f64::from(self.estimated_count) * factor) as u64,
+            (f64::from(self.associated_error) * factor) as u64,
+        )
     }
 
     /// Returns the estimated element occurrence count.
-    pub fn estimated_count(&self) -> u64 {
+    pub fn estimated_count(&self) -> u32 {
         self.estimated_count
     }
 
     /// Returns the associated occurrence count error.
-    pub fn associated_error(&self) -> u64 {
+    pub fn associated_error(&self) -> u32 {
         self.associated_error
     }
 }
@@ -147,7 +168,8 @@ impl AlphaCounters {
 /// is `StableSipHasher128` for cross-platform determinism. This reduces
 /// performance of common operations by 20–25%.
 ///
-/// The space-saving algorithm guarantees the following:
+/// While per-item counters have not overflowed, the space-saving algorithm
+/// guarantees the following:
 /// 1. `estimated_count` >= `exact_count`
 /// 2. `estimated_count` - `associated_error` <= `exact_count`
 ///
@@ -160,6 +182,9 @@ impl AlphaCounters {
 /// Monitored entries use a compact indexed heap with u16 slot numbers and heap
 /// positions. The lookup table stores slot numbers without duplicating keys or
 /// cached hashes. Capacity is limited to 65,536 monitored entries.
+/// Per-item counts and errors are stored as u32 (eight bytes per item). Updates
+/// truncate to the low 32 bits on overflow, so estimation guarantees no longer
+/// apply after a counter wraps. The total stream count remains u64.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FilteredSpaceSaving<T: Eq + Hash, H: Hasher + Default = DefaultAlphaHasher> {
@@ -255,9 +280,12 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     ///
     /// Returns its monitoring status after this update and any expelled item.
     ///
-    /// Computes in **O(log(k))** time, or **O(k)** when the filter is rebased.
+    /// Computes in **O(log(k))** time, or **O(k)** when the filter is rebased
+    /// or the lookup table's deleted buckets are cleared.
+    ///
+    /// Per-item estimates and errors truncate to their low 32 bits on overflow.
     pub fn insert(&mut self, x: T, count: u64) -> InsertResult<T> {
-        self.count += count;
+        self.count = self.count.wrapping_add(count);
 
         if self.k == 0 {
             return InsertResult::Rejected;
@@ -272,18 +300,19 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
 
         let x_hash = self.alpha_hash(&x);
         let (min_elem, min_counter) = self.monitored_list.peek().unwrap();
-        if self.alphas.get(x_hash) + count < min_counter.estimated_count {
-            self.alphas.set(x_hash, self.alphas.get(x_hash) + count);
+        let estimated = self.alphas.get(x_hash).wrapping_add(count);
+        if estimated < u64::from(min_counter.estimated_count()) {
+            self.alphas.set(x_hash, estimated);
             return InsertResult::Rejected;
         }
 
         let m_hash = self.alpha_hash(min_elem);
-        self.alphas.raise(m_hash, min_counter.estimated_count);
+        let minimum = u64::from(min_counter.estimated_count());
+        self.alphas.raise(m_hash, minimum);
 
-        let (expelled, _) = self.monitored_list.replace_min(
-            x,
-            ElementCounter::new(self.alphas.get(x_hash) + count, self.alphas.get(x_hash)),
-        );
+        let error = self.alphas.get(x_hash);
+        let counter = ElementCounter::new(error.wrapping_add(count), error);
+        let (expelled, _) = self.monitored_list.replace_min(x, counter);
         InsertResult::Replaced { expelled }
     }
 
@@ -320,6 +349,7 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     ///
     /// Computes in **O(k*log(k))** time, or **O(k^2)** if repeated filter
     /// updates require rebasing.
+    /// Per-item estimates and errors truncate to their low 32 bits on overflow.
     pub fn merge(&mut self, other: &FilteredSpaceSaving<T, H>) -> Result<(), InvalidMergeError>
     where
         T: Clone,
@@ -327,16 +357,15 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
         if self.k != other.k {
             return Err(InvalidMergeError { expect: self.k, actual: other.k });
         }
-        self.count += other.count;
+        self.count = self.count.wrapping_add(other.count);
         for (key, value) in self.monitored_list.iter_mut() {
             if let Some((_, e)) = other.monitored_list.get(key) {
-                value.estimated_count += e.estimated_count;
-                value.associated_error += e.associated_error;
+                *value =
+                    value.plus(u64::from(e.estimated_count()), u64::from(e.associated_error()));
             } else {
                 let k_hash = other.alpha_hash(key);
                 let a2 = other.alphas.get(k_hash);
-                value.estimated_count += a2;
-                value.associated_error += a2;
+                *value = value.plus(a2, a2);
             }
         }
         self.monitored_list.rebuild_heap();
@@ -346,7 +375,7 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
             }
             let k_hash = self.alpha_hash(key);
             let a1 = self.alphas.get(k_hash);
-            let e = ElementCounter::new(value.estimated_count + a1, value.associated_error + a1);
+            let e = value.plus(a1, a1);
             if self.monitored_list.len() < self.k {
                 // We have fewer than k items, so add a new item.
                 self.monitored_list.push(key.clone(), e);
@@ -361,14 +390,14 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
                 // in `alphas`.
                 let popped = self.monitored_list.replace_min(key.clone(), e);
                 let p_hash = self.alpha_hash(&popped.0);
-                self.alphas.raise(p_hash, popped.1.estimated_count);
+                self.alphas.raise(p_hash, u64::from(popped.1.estimated_count()));
             } else {
                 // This item is not in the Top-K and cannot replace any existing
                 // item, but we still need to track the error.
                 //
                 // We use `max` here because the worst possible error is the
                 // larger of the errors of the two inputs, not the sum.
-                self.alphas.raise(k_hash, e.estimated_count);
+                self.alphas.raise(k_hash, u64::from(e.estimated_count()));
             }
         }
         self.alphas.merge(&other.alphas);
@@ -378,10 +407,12 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     /// Decays the counters, equivalent to multiplying all counters by the factor.
     ///
     /// Computes in **O(k)** time.
+    /// Fractional values are discarded; per-item counters truncate to their low
+    /// 32 bits after conversion to u64. Floating-point conversion to u64
+    /// saturates at the bounds and maps NaN to zero.
     pub fn decay(&mut self, factor: f64) {
         for (_, value) in self.monitored_list.iter_mut() {
-            value.estimated_count = (value.estimated_count as f64 * factor) as u64;
-            value.associated_error = (value.associated_error as f64 * factor) as u64;
+            *value = value.scaled(factor);
         }
         self.monitored_list.rebuild_heap();
         self.alphas.decay(factor);
@@ -458,6 +489,69 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn test_u32_counter_storage_and_truncation() {
+        assert_eq!(std::mem::size_of::<ElementCounter>(), 8);
+        let counter = ElementCounter::new(u64::from(u32::MAX) + 6, u64::from(u32::MAX) + 3);
+        let estimated: u32 = counter.estimated_count();
+        let error: u32 = counter.associated_error();
+        assert_eq!((estimated, error), (5, 2));
+        let mut counter = ElementCounter::new(u64::from(u32::MAX), u64::from(u32::MAX));
+        counter.increase(1);
+        assert_eq!(counter.estimated_count(), 0);
+        assert_eq!(counter.plus(2, 1), ElementCounter::new(2, 0));
+    }
+
+    #[test]
+    fn test_insert_wraps_counts_and_preserves_heap_order() {
+        let mut fss = FilteredSpaceSaving::new(2);
+        fss.insert("a", u64::from(u32::MAX));
+        fss.insert("b", 10);
+        assert_eq!(fss.insert("a", 1), InsertResult::Updated);
+        assert_eq!(fss.get(&"a").unwrap().estimated_count(), 0);
+        assert_eq!(fss.count(), u64::from(u32::MAX) + 11);
+        assert_eq!(fss.insert("c", 1), InsertResult::Replaced { expelled: "a" });
+        assert!(fss.get(&"b").is_some());
+    }
+
+    #[test]
+    fn test_large_insert_weights_truncate_without_panicking() {
+        let mut fss = FilteredSpaceSaving::new(1);
+        let weight = (1u64 << 32) + 4;
+        assert_eq!(fss.insert("a", weight), InsertResult::Inserted);
+        assert_eq!(fss.get(&"a").unwrap().estimated_count(), 4);
+        assert_eq!(fss.insert("a", (1u64 << 32) + 3), InsertResult::Updated);
+        assert_eq!(fss.get(&"a").unwrap().estimated_count(), 7);
+        assert_eq!(fss.count(), (2u64 << 32) + 7);
+        let mut empty = FilteredSpaceSaving::new(0);
+        empty.insert("a", weight);
+        assert_eq!(empty.estimate(&"a"), ElementCounter::new(4, 4));
+    }
+
+    #[test]
+    fn test_merge_wraps_counts_and_rebuilds_heap() {
+        let mut left = FilteredSpaceSaving::new(2);
+        left.insert("a", u64::from(u32::MAX));
+        left.insert("b", 10);
+        let mut right = FilteredSpaceSaving::new(2);
+        right.insert("a", 1);
+        left.merge(&right).unwrap();
+        assert_eq!(left.get(&"a").unwrap().estimated_count(), 0);
+        assert_eq!(left.count(), u64::from(u32::MAX) + 11);
+        assert_eq!(left.insert("c", 1), InsertResult::Replaced { expelled: "a" });
+    }
+
+    #[test]
+    fn test_decay_truncates_scaled_counts_and_rebuilds_heap() {
+        let mut fss = FilteredSpaceSaving::new(2);
+        fss.insert("a", 1u64 << 31);
+        fss.insert("b", 5);
+        fss.decay(2.0);
+        assert_eq!(fss.get(&"a").unwrap().estimated_count(), 0);
+        assert_eq!(fss.get(&"b").unwrap().estimated_count(), 10);
+        assert_eq!(fss.insert("c", 1), InsertResult::Replaced { expelled: "a" });
+    }
 
     #[test]
     fn test_insert_reports_membership_and_expulsion() {
@@ -624,8 +718,8 @@ mod tests {
         }
         for (key, count) in exact {
             let estimate = left.estimate(&key);
-            assert!(estimate.estimated_count() >= count);
-            assert!(estimate.estimated_count() - estimate.associated_error() <= count);
+            assert!(u64::from(estimate.estimated_count()) >= count);
+            assert!(u64::from(estimate.estimated_count() - estimate.associated_error()) <= count);
         }
     }
 
@@ -724,7 +818,7 @@ mod tests {
         assert_eq!(fss.monitored_list.len(), 0);
     }
 
-    fn topk_of<'a>(fss: &'a FilteredSpaceSaving<&str>) -> Vec<(&'a str, u64)> {
+    fn topk_of<'a>(fss: &'a FilteredSpaceSaving<&str>) -> Vec<(&'a str, u32)> {
         let mut result = Vec::with_capacity(fss.monitored_list.len());
         result.extend(fss.monitored_list.iter());
         result.sort_by(|a, b| b.1.cmp(&a.1));
@@ -880,8 +974,8 @@ mod tests {
             // Check Lemma 3 for ALL items via estimate()
             for (key, &exact) in &exact_counts {
                 let estimate = fss.estimate(key);
-                let estimated = estimate.estimated_count();
-                let error = estimate.associated_error();
+                let estimated = u64::from(estimate.estimated_count());
+                let error = u64::from(estimate.associated_error());
 
                 // Invariant 1: Never underestimates
                 prop_assert!(estimated >= exact,
@@ -923,8 +1017,8 @@ mod tests {
             // will have estimate() return low alpha, failing estimated >= exact
             for (key, &exact) in &exact_counts {
                 let estimate = fss_a.estimate(key);
-                let estimated = estimate.estimated_count();
-                let error = estimate.associated_error();
+                let estimated = u64::from(estimate.estimated_count());
+                let error = u64::from(estimate.associated_error());
 
                 prop_assert!(estimated >= exact,
                     "Merge underestimate: key={}, est={}, err={}, exact={}", key, estimated, error, exact);
@@ -973,8 +1067,8 @@ mod tests {
                 // reundant with the insert tests, and exact dump/load tests
                 // above, but we write it out explicitly for documentation
                 // purposes, and to be extremely careful.
-                let estimated = restored.estimated_count();
-                let error = restored.associated_error();
+                let estimated = u64::from(restored.estimated_count());
+                let error = u64::from(restored.associated_error());
 
                 prop_assert!(estimated >= exact,
                     "Serde roundtrip underestimate: key={}, est={}, err={}, exact={}",
