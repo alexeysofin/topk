@@ -13,9 +13,21 @@ When filter values span more than 255, the offset advances and low values are
 rounded up to it. This can increase count estimates and change the returned top-k.
 Rebasing scans the filter in place and does not allocate additional counter storage.
 
-With the `serde` feature, `alphas` is now serialized as an object containing
-`offset` and byte `deltas`. Existing snapshots with an array of 64-bit `alphas`
-must be migrated before deserialization.
+Monitored items use a compact indexed heap: a single array of keys and counters,
+two arrays of `u16` heap indices, and a hash table containing only `u16` slot
+indices. Capacity is limited to 65,536 items. Lookup is expected O(1), minimum
+access is O(1), and heap updates are O(log k). Keys are compared for equality,
+so hash collisions do not merge distinct items. Owned key buffers, such as String
+contents, are additional to the sketch's storage.
+
+`insert` returns `InsertResult::Updated`, `Rejected`, `Inserted`, or
+`Replaced { expelled }`, reporting membership immediately after the insertion.
+Later insertions may still expel the item.
+
+With the `serde` feature, `alphas` is serialized as an object containing `offset`
+and byte `deltas`, and `monitored_list` contains a `capacity` and an `entries`
+array. Heap indices and the lookup table are rebuilt on load. Snapshots using
+the previous array formats must be migrated before deserialization.
 
 ### Example
 

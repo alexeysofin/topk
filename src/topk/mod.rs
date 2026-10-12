@@ -1,10 +1,8 @@
 #[cfg(not(feature = "serde"))]
 use ahash::AHasher;
-use ahash::RandomState;
-use priority_queue::PriorityQueue;
 #[cfg(feature = "serde")]
 use rustc_stable_hash::StableSipHasher128;
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -58,7 +56,8 @@ impl PartialOrd for ElementCounter {
     }
 }
 
-type MonitoredList<T> = PriorityQueue<T, Reverse<ElementCounter>, RandomState>;
+mod monitored;
+use monitored::{MonitoredList, MAX_ITEMS};
 
 const ALPHAS_FACTOR: usize = 6;
 
@@ -157,8 +156,12 @@ impl AlphaCounters {
 /// This keeps filter storage fixed but can increase estimates and change the
 /// returned Top-K. Rebasing takes O(k) time. With serde, the filter is serialized
 /// as an offset and byte deltas, rather than the previous array of u64 values.
+///
+/// Monitored entries use a compact indexed heap with u16 slot numbers and heap
+/// positions. The lookup table stores slot numbers without duplicating keys or
+/// cached hashes. Capacity is limited to 65,536 monitored entries.
 #[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FilteredSpaceSaving<T: Eq + Hash, H: Hasher + Default = DefaultAlphaHasher> {
     k: usize,
     monitored_list: MonitoredList<T>,
@@ -168,10 +171,59 @@ pub struct FilteredSpaceSaving<T: Eq + Hash, H: Hasher + Default = DefaultAlphaH
     _hasher: PhantomData<H>,
 }
 
+/// Whether an item is monitored immediately after insertion. Later insertions
+/// can still expel it; this is not a guarantee about the final Top-K.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InsertResult<T> {
+    /// An already monitored item's count increased.
+    Updated,
+    /// The item did not enter the monitored list.
+    Rejected,
+    /// The item filled a free slot.
+    Inserted,
+    /// The item entered the list and expelled the returned key.
+    Replaced { expelled: T },
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: Eq + Hash + serde::Deserialize<'de>, H: Hasher + Default> serde::Deserialize<'de>
+    for FilteredSpaceSaving<T, H>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Snapshot<T: Eq + Hash> {
+            k: usize,
+            monitored_list: MonitoredList<T>,
+            alphas: AlphaCounters,
+            count: u64,
+        }
+        let snapshot = Snapshot::<T>::deserialize(deserializer)?;
+        if snapshot.k > MAX_ITEMS
+            || snapshot.monitored_list.capacity() != snapshot.k
+            || snapshot.alphas.len() != ALPHAS_FACTOR * snapshot.k
+        {
+            return Err(serde::de::Error::custom("inconsistent sketch capacity"));
+        }
+        let max_delta = snapshot.alphas.deltas.iter().copied().max().unwrap_or(0);
+        if snapshot.alphas.offset.checked_add(u64::from(max_delta)).is_none() {
+            return Err(serde::de::Error::custom("invalid alpha offset"));
+        }
+        Ok(Self {
+            k: snapshot.k,
+            monitored_list: snapshot.monitored_list,
+            alphas: snapshot.alphas,
+            count: snapshot.count,
+            _hasher: PhantomData,
+        })
+    }
+}
+
 // `new` implicitly forces the use of DefaultAlphaHasher for convenience and
 // backwards compatibility.
 impl<T: Eq + Hash> FilteredSpaceSaving<T, DefaultAlphaHasher> {
     /// Creates an empty filtered space-saving structure with pre-allocated space for `k` elements.
+    ///
+    /// Panics if `k` exceeds 65,536, the capacity of the compact slot indices.
     ///
     /// Uses `DefaultAlphaHasher` for alpha bucket hashing, which is `AHasher` by default
     /// for performance, or `StableSipHasher128` when the `serde` feature is enabled for
@@ -186,10 +238,13 @@ impl<T: Eq + Hash> FilteredSpaceSaving<T, DefaultAlphaHasher> {
 // This is the same pattern used by Rust's `HashMap`.
 impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     /// Creates an empty filtered space-saving structure with a custom hasher.
+    ///
+    /// Panics if `k` exceeds 65,536. A zero-capacity sketch rejects all inserts.
     pub fn with_hasher(k: usize) -> Self {
+        assert!(k <= MAX_ITEMS, "k must be at most {MAX_ITEMS}");
         Self {
             k,
-            monitored_list: MonitoredList::with_capacity_and_default_hasher(k),
+            monitored_list: MonitoredList::new(k),
             alphas: AlphaCounters::new(ALPHAS_FACTOR * k),
             count: 0,
             _hasher: PhantomData,
@@ -198,33 +253,38 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
 
     /// Inserts the item `x` for `count` times.
     ///
+    /// Returns its monitoring status after this update and any expelled item.
+    ///
     /// Computes in **O(log(k))** time, or **O(k)** when the filter is rebased.
-    pub fn insert(&mut self, x: T, count: u64) {
+    pub fn insert(&mut self, x: T, count: u64) -> InsertResult<T> {
         self.count += count;
 
-        if self.monitored_list.change_priority_by(&x, |e| e.0.estimated_count += count) {
-            return;
+        if self.k == 0 {
+            return InsertResult::Rejected;
+        }
+        if self.monitored_list.increase(&x, count) {
+            return InsertResult::Updated;
         }
         if self.monitored_list.len() < self.k {
-            self.monitored_list.push(x, Reverse(ElementCounter::new(count, 0)));
-            return;
+            self.monitored_list.push(x, ElementCounter::new(count, 0));
+            return InsertResult::Inserted;
         }
 
         let x_hash = self.alpha_hash(&x);
         let (min_elem, min_counter) = self.monitored_list.peek().unwrap();
-        if self.alphas.get(x_hash) + count < min_counter.0.estimated_count {
+        if self.alphas.get(x_hash) + count < min_counter.estimated_count {
             self.alphas.set(x_hash, self.alphas.get(x_hash) + count);
-            return;
+            return InsertResult::Rejected;
         }
 
         let m_hash = self.alpha_hash(min_elem);
-        self.alphas.raise(m_hash, min_counter.0.estimated_count);
+        self.alphas.raise(m_hash, min_counter.estimated_count);
 
-        self.monitored_list.pop();
-        self.monitored_list.push(
+        let (expelled, _) = self.monitored_list.replace_min(
             x,
-            Reverse(ElementCounter::new(self.alphas.get(x_hash) + count, self.alphas.get(x_hash))),
+            ElementCounter::new(self.alphas.get(x_hash) + count, self.alphas.get(x_hash)),
         );
+        InsertResult::Replaced { expelled }
     }
 
     /// Estimates the occurrences of the item `x` if the item is in the Top-K approximation.
@@ -233,7 +293,7 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     ///
     /// Computes in **O(1)** time.
     pub fn get(&self, x: &T) -> Option<ElementCounter> {
-        self.monitored_list.get(x).and_then(|(_, v)| Some(v.0))
+        self.monitored_list.get(x).map(|(_, counter)| *counter)
     }
 
     /// Estimates the occurrences of the item `x`.
@@ -245,7 +305,7 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     /// Computes in **O(1)** time.
     pub fn estimate(&self, x: &T) -> ElementCounter {
         self.get(x).unwrap_or_else(|| {
-            let count = self.alphas.get(self.alpha_hash(&x));
+            let count = if self.k == 0 { self.count } else { self.alphas.get(self.alpha_hash(&x)) };
             ElementCounter::new(count, count)
         })
     }
@@ -270,29 +330,27 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
         self.count += other.count;
         for (key, value) in self.monitored_list.iter_mut() {
             if let Some((_, e)) = other.monitored_list.get(key) {
-                value.0.estimated_count += e.0.estimated_count;
-                value.0.associated_error += e.0.associated_error;
+                value.estimated_count += e.estimated_count;
+                value.associated_error += e.associated_error;
             } else {
                 let k_hash = other.alpha_hash(key);
                 let a2 = other.alphas.get(k_hash);
-                value.0.estimated_count += a2;
-                value.0.associated_error += a2;
+                value.estimated_count += a2;
+                value.associated_error += a2;
             }
         }
+        self.monitored_list.rebuild_heap();
         for (key, value) in other.monitored_list.iter() {
             if self.monitored_list.contains(key) {
                 continue;
             }
             let k_hash = self.alpha_hash(key);
             let a1 = self.alphas.get(k_hash);
-            let e = Reverse(ElementCounter::new(
-                value.0.estimated_count + a1,
-                value.0.associated_error + a1,
-            ));
+            let e = ElementCounter::new(value.estimated_count + a1, value.associated_error + a1);
             if self.monitored_list.len() < self.k {
                 // We have fewer than k items, so add a new item.
                 self.monitored_list.push(key.clone(), e);
-            } else if self.monitored_list.peek().map_or(true, |(_, m)| m.0 < e.0) {
+            } else if self.monitored_list.peek().map_or(false, |(_, m)| *m < e) {
                 // We want to evict an item and replace it with this one, but we
                 // need to update the error accordingly.
                 //
@@ -301,17 +359,16 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
                 // update the `alphas` array because it may contain counted
                 // items that were counted purely in `monitored_list` and never
                 // in `alphas`.
-                let popped = self.monitored_list.pop().unwrap();
+                let popped = self.monitored_list.replace_min(key.clone(), e);
                 let p_hash = self.alpha_hash(&popped.0);
-                self.alphas.raise(p_hash, popped.1 .0.estimated_count);
-                self.monitored_list.push(key.clone(), e);
+                self.alphas.raise(p_hash, popped.1.estimated_count);
             } else {
                 // This item is not in the Top-K and cannot replace any existing
                 // item, but we still need to track the error.
                 //
                 // We use `max` here because the worst possible error is the
                 // larger of the errors of the two inputs, not the sum.
-                self.alphas.raise(k_hash, e.0.estimated_count);
+                self.alphas.raise(k_hash, e.estimated_count);
             }
         }
         self.alphas.merge(&other.alphas);
@@ -323,9 +380,10 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
     /// Computes in **O(k)** time.
     pub fn decay(&mut self, factor: f64) {
         for (_, value) in self.monitored_list.iter_mut() {
-            value.0.estimated_count = (value.0.estimated_count as f64 * factor) as u64;
-            value.0.associated_error = (value.0.associated_error as f64 * factor) as u64;
+            value.estimated_count = (value.estimated_count as f64 * factor) as u64;
+            value.associated_error = (value.associated_error as f64 * factor) as u64;
         }
+        self.monitored_list.rebuild_heap();
         self.alphas.decay(factor);
         self.count = (self.count as f64 * factor) as u64
     }
@@ -341,22 +399,19 @@ impl<T: Eq + Hash, H: Hasher + Default> FilteredSpaceSaving<T, H> {
 
     /// Returns an iterator in arbitrary order over the Top-K items.
     pub fn iter(&self) -> impl Iterator<Item = (&T, &ElementCounter)> {
-        self.monitored_list.iter().map(|(k, v)| (k, &v.0))
+        self.monitored_list.iter()
     }
 
     /// Consumes the `FilteredSpaceSaving` and return an iterator in arbitrary order over the Top-K items.
     pub fn into_iter(self) -> impl Iterator<Item = (T, ElementCounter)> {
-        self.monitored_list.into_iter().map(|(k, v)| (k, v.0))
+        self.monitored_list.into_iter()
     }
 
     /// Consumes the `FilteredSpaceSaving` and return a `Vec` with Top-K items and counters in descending order (top items first).
     ///
     /// Computes in **O(k*log(k))** time.
     pub fn into_sorted_vec(self) -> Vec<(T, ElementCounter)> {
-        let mut result = Vec::with_capacity(self.monitored_list.len());
-        result.extend(self.monitored_list.into_sorted_iter().map(|(k, v)| (k, v.0)));
-        result.reverse();
-        result
+        self.monitored_list.into_sorted_vec()
     }
 
     /// Consumes the `FilteredSpaceSaving` and return a `DoubleEndedIterator` with Top-K items and counters in descending order (top items first).
@@ -403,6 +458,75 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn test_insert_reports_membership_and_expulsion() {
+        let mut fss = FilteredSpaceSaving::new(1);
+        assert_eq!(fss.insert("heavy", 1000), InsertResult::Inserted);
+        assert_eq!(fss.insert("heavy", 10), InsertResult::Updated);
+        assert_eq!(fss.insert("noise", 1), InsertResult::Rejected);
+        assert!(fss.get(&"heavy").is_some());
+        assert!(fss.get(&"noise").is_none());
+        assert_eq!(fss.insert("replacement", 2000), InsertResult::Replaced { expelled: "heavy" });
+        assert!(fss.get(&"heavy").is_none());
+        assert!(fss.get(&"replacement").is_some());
+        assert_eq!(fss.insert("replacement", 1), InsertResult::Updated);
+    }
+
+    #[test]
+    fn test_zero_capacity_sketch() {
+        let mut fss = FilteredSpaceSaving::new(0);
+        assert_eq!(fss.insert(1, 100), InsertResult::Rejected);
+        assert_eq!(fss.estimate(&1), ElementCounter::new(100, 100));
+        assert_eq!(fss.iter().count(), 0);
+        let mut other = FilteredSpaceSaving::new(0);
+        other.insert(2, 10);
+        fss.merge(&other).unwrap();
+        assert_eq!(fss.estimate(&2), ElementCounter::new(110, 110));
+        fss.clear();
+        assert_eq!(fss.count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "k must be at most")]
+    fn test_capacity_exceeding_u16_indices_is_rejected() {
+        let _ = FilteredSpaceSaving::<u64>::new(MAX_ITEMS + 1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_rebuilds_index_and_heap_for_future_updates() {
+        let mut fss = FilteredSpaceSaving::new(10);
+        for key in 0..3u64 {
+            fss.insert(key, 100 - key);
+        }
+        let serialized = serde_json::to_string(&fss).unwrap();
+        let mut restored: FilteredSpaceSaving<u64> = serde_json::from_str(&serialized).unwrap();
+        for key in 0..100 {
+            assert_eq!(fss.insert(key, 1000), restored.insert(key, 1000));
+        }
+        assert_eq!(fss.into_sorted_vec(), restored.into_sorted_vec());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_rejects_inconsistent_storage() {
+        let mut fss = FilteredSpaceSaving::new(2);
+        fss.insert(1u64, 100);
+        fss.insert(2, 200);
+        let snapshot = serde_json::to_value(&fss).unwrap();
+        let mut duplicate = snapshot.clone();
+        duplicate["monitored_list"]["entries"][1] =
+            duplicate["monitored_list"]["entries"][0].clone();
+        assert!(serde_json::from_value::<FilteredSpaceSaving<u64>>(duplicate).is_err());
+        let mut mismatched = snapshot.clone();
+        mismatched["monitored_list"]["capacity"] = 3.into();
+        assert!(serde_json::from_value::<FilteredSpaceSaving<u64>>(mismatched).is_err());
+        let mut invalid_offset = snapshot;
+        invalid_offset["alphas"]["offset"] = u64::MAX.into();
+        invalid_offset["alphas"]["deltas"][0] = 1.into();
+        assert!(serde_json::from_value::<FilteredSpaceSaving<u64>>(invalid_offset).is_err());
+    }
 
     #[test]
     fn test_alpha_rebase_and_clipping() {
@@ -597,12 +721,12 @@ mod tests {
         for i in 0..fss.alphas.len() {
             assert_eq!(fss.alphas.get(i), 0);
         }
-        assert!(fss.monitored_list.is_empty());
+        assert_eq!(fss.monitored_list.len(), 0);
     }
 
     fn topk_of<'a>(fss: &'a FilteredSpaceSaving<&str>) -> Vec<(&'a str, u64)> {
         let mut result = Vec::with_capacity(fss.monitored_list.len());
-        result.extend(fss.monitored_list.iter().map(|(k, v)| (k, &v.0)));
+        result.extend(fss.monitored_list.iter());
         result.sort_by(|a, b| b.1.cmp(&a.1));
         result.iter().map(|(&name, &counter)| (name, counter.estimated_count())).collect::<Vec<_>>()
     }
