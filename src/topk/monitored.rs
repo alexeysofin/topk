@@ -82,15 +82,8 @@ impl<T: Eq + Hash> MonitoredList<T> {
             Some(slot) => usize::from(slot),
             None => return false,
         };
-        let previous = self.entries[slot].1;
-        self.entries[slot].1.increase(count);
-        let position = usize::from(self.positions[slot]);
-        if self.entries[slot].1 < previous {
-            // Truncation can turn an increment into a smaller count.
-            self.sift_up(position);
-        } else {
-            self.sift_down(position);
-        }
+        self.entries[slot].1.estimated_count += count;
+        self.sift_down(usize::from(self.positions[slot]));
         true
     }
 
@@ -117,32 +110,13 @@ impl<T: Eq + Hash> MonitoredList<T> {
         self.lookup.find_entry(old_hash, |&candidate| candidate == slot).unwrap().remove();
         let hash = Self::hash_key(&self.hash_builder, &key);
         let expelled = std::mem::replace(&mut self.entries[usize::from(slot)], (key, counter));
-        // Deleted buckets can exhaust growth_left even though the number of
-        // live keys stays fixed. Hashbrown would then enlarge the table. Clear
-        // its tombstones and reinsert the live slots into the same allocation.
-        if self.lookup.capacity() < self.entries.len() {
-            self.rebuild_lookup();
-        } else {
-            let entries = &self.entries;
-            let hash_builder = &self.hash_builder;
-            self.lookup.insert_unique(hash, slot, |&slot| {
-                Self::hash_key(hash_builder, &entries[usize::from(slot)].0)
-            });
-        }
-        self.sift_down(0);
-        expelled
-    }
-
-    fn rebuild_lookup(&mut self) {
-        self.lookup.clear();
         let entries = &self.entries;
         let hash_builder = &self.hash_builder;
-        for (slot, (key, _)) in entries.iter().enumerate() {
-            let hash = Self::hash_key(hash_builder, key);
-            self.lookup.insert_unique(hash, slot as u16, |&slot| {
-                Self::hash_key(hash_builder, &entries[usize::from(slot)].0)
-            });
-        }
+        self.lookup.insert_unique(hash, slot, |&slot| {
+            Self::hash_key(hash_builder, &entries[usize::from(slot)].0)
+        });
+        self.sift_down(0);
+        expelled
     }
 
     fn less(&self, a: usize, b: usize) -> bool {
@@ -283,32 +257,10 @@ mod tests {
         for key in 8..100 {
             let expelled = list.replace_min(CollisionKey(key), ElementCounter::new(key + 1, 0));
             assert!(list.get(&expelled.0).is_none());
-            assert_eq!(
-                u64::from(list.get(&CollisionKey(key)).unwrap().1.estimated_count()),
-                key + 1
-            );
+            assert_eq!(list.get(&CollisionKey(key)).unwrap().1.estimated_count, key + 1);
             assert_heap(&list);
         }
         assert!(list.increase(&CollisionKey(99), 100));
-        assert_heap(&list);
-    }
-
-    #[test]
-    fn replacing_keys_keeps_lookup_allocation_fixed() {
-        // Fill the hash table to its available capacity, forcing deletion
-        // cleanup during replacements instead of relying on spare buckets.
-        let capacity = MonitoredList::<u64>::new(1000).lookup.capacity();
-        let mut list = MonitoredList::new(capacity);
-        for key in 0..capacity as u64 {
-            list.push(key, ElementCounter::new(key, 0));
-        }
-        for key in capacity as u64..capacity as u64 + 10_000 {
-            list.replace_min(key, ElementCounter::new(key, 0));
-            assert!(list.lookup.capacity() <= capacity);
-        }
-        list.lookup.clear();
-        assert_eq!(list.lookup.capacity(), capacity);
-        list.rebuild_lookup();
         assert_heap(&list);
     }
 
@@ -353,7 +305,7 @@ mod tests {
             let mut reference = HashMap::<u64, ElementCounter>::new();
             for (key, count) in updates {
                 if let Some(counter) = reference.get_mut(&key) {
-                    counter.increase(count);
+                    counter.estimated_count += count;
                     prop_assert!(list.increase(&key, count));
                 } else {
                     let counter = ElementCounter::new(count, 0);

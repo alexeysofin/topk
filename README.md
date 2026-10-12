@@ -20,14 +20,6 @@ access is O(1), and heap updates are O(log k). Keys are compared for equality,
 so hash collisions do not merge distinct items. Owned key buffers, such as String
 contents, are additional to the sketch's storage.
 
-Each monitored item stores a `u32` estimated count and a `u32` error (eight
-bytes total). Count getters return `u32`; insertion weights and the overall
-stream count remain `u64`. Per-item counts and errors truncate to their low 32
-bits on overflow instead of panicking, in both debug and release builds.
-Estimation guarantees no longer hold after a counter wraps. Serialized
-per-item counter fields are now u32, so snapshots containing values above
-`u32::MAX` cannot be loaded.
-
 `insert` returns `InsertResult::Updated`, `Rejected`, `Inserted`, or
 `Replaced { expelled }`, reporting membership immediately after the insertion.
 Later insertions may still expel the item.
